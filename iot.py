@@ -97,6 +97,14 @@ else:
 class SharedDataManager:
     def __init__(self):
         self._lock = threading.Lock()
+        
+        # Initialize history with one zero to ensure Plotly renders immediately
+        initial_history = {
+            "bpm": collections.deque([0], maxlen=100),
+            "breathing": collections.deque([0], maxlen=100),
+            "movement": collections.deque([0], maxlen=100)
+        }
+        
         self.data_store = {
             "sensor_config": {
                 "heart_rate": False,
@@ -110,13 +118,10 @@ class SharedDataManager:
                 "breathing_rate": 0,
                 "movement_level": 0,
                 "is_crying": False,
-                "timestamp": 0
+                "timestamp": 0,
+                "live_rms": 0 # Track live RMS for better audio feedback
             },
-            "history": {
-                "bpm": collections.deque(maxlen=100),
-                "breathing": collections.deque(maxlen=100),
-                "movement": collections.deque(maxlen=100)
-            }
+            "history": initial_history
         }
 
     def update_config(self, config):
@@ -129,17 +134,26 @@ class SharedDataManager:
 
     def update_readings(self, readings):
         with self._lock:
-            self.data_store["live_readings"] = readings
-            self.data_store["history"]["bpm"].append(readings["bpm"])
-            self.data_store["history"]["breathing"].append(readings["breathing_rate"])
-            self.data_store["history"]["movement"].append(readings["movement_level"])
+            # Preserve history state during update
+            hist = self.data_store["history"]
+            
+            self.data_store["live_readings"].update(readings)
+
+            # Only append if the corresponding sensor is configured to run (to prevent adding 0s unnecessarily)
+            if self.data_store["sensor_config"]["heart_rate"]:
+                hist["bpm"].append(readings.get("bpm", 0))
+            if self.data_store["sensor_config"]["breathing"]:
+                hist["breathing"].append(readings.get("breathing_rate", 0))
+            if self.data_store["sensor_config"]["movement"]:
+                hist["movement"].append(readings.get("movement_level", 0))
+
 
     def get_data(self):
         with self._lock:
             return {
-                "live": self.data_store["live_readings"],
+                "live": self.data_store["live_readings"].copy(),
                 "history": self.data_store["history"],
-                "config": self.data_store["sensor_config"]
+                "config": self.data_store["sensor_config"].copy()
             }
 
 state_manager = SharedDataManager()
@@ -149,10 +163,9 @@ state_manager = SharedDataManager()
 # ==========================================
 class MediaProcessor:
     def __init__(self):
-        self.prev_gray = None
-        # Buffers for signal processing
-        self.green_buffer = collections.deque(maxlen=300) 
-        self.audio_buffer = collections.deque(maxlen=50)
+        # NOTE: For Streamlit, self.prev_gray is problematic as a processor is instantiated per frame.
+        # We accept a slightly less accurate movement reading for this architecture constraint.
+        pass
         
     def process_heart_rate(self, frame):
         h, w, _ = frame.shape
@@ -160,42 +173,51 @@ class MediaProcessor:
         
         if roi.size == 0: return 0
         g_mean = np.mean(roi[:, :, 1])
-        self.green_buffer.append(g_mean)
         
-        if len(self.green_buffer) > 30:
-            # Simplified PPG calculation
-            return int(70 + (np.std(self.green_buffer) % 40)) 
+        # We rely on the global deque inside the Video Callback for signal processing buffer
+        # In a single-file Streamlit app, we have to cheat and grab the global history deque
+        global_history = state_manager.get_data()["history"]["bpm"]
+        global_history.append(g_mean)
+
+        if len(global_history) > 30:
+            # Simplified PPG calculation based on signal fluctuation
+            # Using the last 30 frames for a quick mock BPM estimate
+            signal_window = np.array(list(global_history)[-30:])
+            # A simple simulation that changes the BPM based on noise/signal variance
+            return int(70 + (np.std(signal_window) * 5)) 
         return 0
 
-    def process_movement(self, frame):
+    def process_movement(self, frame, prev_gray):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (21, 21), 0)
         
         movement_score = 0
-        if self.prev_gray is not None:
-            delta_frame = cv2.absdiff(self.prev_gray, gray)
-            thresh = cv2.threshold(delta_frame, 25, 255, cv2.THRESH_BINARY)[1]
+        if prev_gray is not None:
+            # Simple optical flow / frame differencing
+            delta_frame = cv2.absdiff(prev_gray, gray)
+            thresh = cv2.threshold(delta_frame, 20, 255, cv2.THRESH_BINARY)[1] # Lower threshold (20) for sensitivity
             
             # *** SENSITIVITY INCREASED FOR MINUTE MOVEMENTS ***
-            # Normalized by 5000 instead of 10000
+            # Normalized by 5000 instead of 10000 -> higher score for same movement
             movement_score = np.sum(thresh) / 5000 
             
-        self.prev_gray = gray
-        return min(movement_score, 100)
+        return min(movement_score, 100), gray
 
     def process_breathing(self, frame):
-        # Mock breathing signal
+        # Mock breathing signal, as accurate optical flow for respiration requires stable conditions
         return 20 + np.random.randint(-2, 3)
+
+# Global state for movement processing (must be outside the callback)
+_prev_gray_frame = None
 
 # WebRTC Video Callback
 def video_frame_callback(frame: av.VideoFrame):
+    global _prev_gray_frame
+    
     img = frame.to_ndarray(format="bgr24")
     config = state_manager.get_config()
     
     bpm, movement, breathing = 0, 0, 0
-    # NOTE: MediaProcessor should ideally be a singleton if it holds state (like self.prev_gray)
-    # For Streamlit WebRTC processing, the processor is typically instantiated per frame/chunk,
-    # so we rely on the SharedDataManager for overall state and history.
     processor = MediaProcessor() 
 
     if config["is_active"]:
@@ -206,7 +228,8 @@ def video_frame_callback(frame: av.VideoFrame):
             cv2.rectangle(img, (w//2-50, h//2-50), (w//2+50, h//2+50), (0, 255, 0), 2)
             
         if config["movement"]:
-            movement = processor.process_movement(img)
+            # Pass the global previous frame for continuity
+            movement, _prev_gray_frame = processor.process_movement(img, _prev_gray_frame)
             
         if config["breathing"]:
             breathing = processor.process_breathing(img)
@@ -217,6 +240,7 @@ def video_frame_callback(frame: av.VideoFrame):
             "breathing_rate": breathing if config["breathing"] else 0,
             "movement_level": movement if config["movement"] else 0,
             "is_crying": current_readings["is_crying"],
+            "live_rms": current_readings["live_rms"],
             "timestamp": time.time()
         }
         state_manager.update_readings(new_readings)
@@ -229,6 +253,8 @@ def audio_frame_callback(frame: av.AudioFrame):
     config = state_manager.get_config()
     is_crying = False
     
+    current_readings = state_manager.get_data()["live"]
+    
     if config["is_active"] and config["cry_detection"]:
         # Simple Cry Detection based on Root Mean Square (RMS) volume
         rms = np.sqrt(np.mean(sound**2))
@@ -238,8 +264,13 @@ def audio_frame_callback(frame: av.AudioFrame):
         if rms > 500: 
             is_crying = True
             
-        current_readings = state_manager.get_data()["live"]
-        current_readings["is_crying"] = is_crying
+        # Update shared state with live status and RMS value
+        new_audio_readings = {
+            "is_crying": is_crying,
+            "live_rms": rms
+        }
+        # Merge audio update with existing video/sensor data
+        current_readings.update(new_audio_readings)
         state_manager.update_readings(current_readings)
         
     return frame
@@ -300,7 +331,7 @@ def mobile_sensor_page():
     if config["is_active"]:
         st.success("✅ Analysis Active - Streaming Data...")
         if HAS_DEPS:
-            # Change mode to SENDRECV to allow the Laptop Dashboard to receive the video stream
+            # SENDRECV mode allows the Laptop Dashboard to receive the video stream
             webrtc_streamer(
                 key="neonatal-sensor",
                 mode=WebRtcMode.SENDRECV,
@@ -343,7 +374,6 @@ def laptop_dashboard_page():
             
         if col_stop.button("⏹ Stop"):
             state_manager.update_config({"is_active": False})
-            state_manager.update_config({"is_active": False}) # Ensure config is immediately updated
             st.toast("Analysis Stopped.")
 
     data = state_manager.get_data()
@@ -357,10 +387,11 @@ def laptop_dashboard_page():
 
     # --- Live Video Stream ---
     st.markdown("### 👁️ Live Mobile Feed (Monitor View)")
-    # This element receives the stream from the mobile sensor page
+    
+    # *** WEBRTC FIX APPLIED HERE: Changed mode to SENDRECV for compatibility ***
     webrtc_streamer(
         key="neonatal-monitor-viewer",
-        mode=WebRtcMode.RECVONLY, # Receive mode to display mobile camera
+        mode=WebRtcMode.SENDRECV, # Use SENDRECV to ensure connection handshake succeeds
         rtc_configuration=RTC_CONFIGURATION,
         media_stream_constraints={"video": True, "audio": False}, # Video only for display
     )
@@ -380,13 +411,13 @@ def laptop_dashboard_page():
     mv_status = "status-normal"
     if config["movement"] and live["movement_level"] > 20: 
         mv_status = "status-warning"
-        alerts.append("WARNING: High Movement Detected (Score: {live['movement_level']:.1f})")
+        alerts.append(f"WARNING: High Movement Detected (Score: {live['movement_level']:.1f})")
         
     # Cry Detection Status
     cry_status = "status-normal"
     if config["cry_detection"] and live["is_crying"]:
         cry_status = "status-critical"
-        alerts.append("ALERT: Crying Detected!")
+        alerts.append(f"ALERT: Crying Detected! (Loudness RMS: {live['live_rms']:.0f})")
 
     if alerts:
         for alert in alerts:
@@ -408,14 +439,15 @@ def laptop_dashboard_page():
     st.markdown("### 📈 Live Trends")
     fig = go.Figure()
     
-    if config["heart_rate"] and hist["bpm"]:
+    # Data is guaranteed to have at least one 0 value now, preventing the Plotly crash
+    if config["heart_rate"]:
         # Use np.array for robust plotting against Plotly's type checks
         fig.add_trace(go.Scatter(y=np.array(hist["bpm"]), mode='lines', name='Heart Rate', line=dict(color='red')))
         
-    if config["breathing"] and hist["breathing"]:
+    if config["breathing"]:
         fig.add_trace(go.Scatter(y=np.array(hist["breathing"]), mode='lines', name='Breathing', line=dict(color='blue')))
         
-    if config["movement"] and hist["movement"]:
+    if config["movement"]:
         # Scale movement for visibility
         scaled_mv = np.array(hist["movement"]) * 5
         fig.add_trace(go.Scatter(y=scaled_mv, mode='lines', name='Movement (x5)', line=dict(color='orange', dash='dot')))
