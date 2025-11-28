@@ -1,6 +1,4 @@
 import streamlit as st
-import cv2
-import numpy as np
 import threading
 import time
 import queue
@@ -12,32 +10,54 @@ import sys
 # 0. DEPENDENCY CHECK
 # ==========================================
 # We wrap imports to handle missing libraries gracefully and prevent NameErrors
+HAS_CV2 = True
+HAS_WEBRTC = True
+
+try:
+    # We use opencv-python-headless in the requirements for deployment stability
+    import cv2 
+except ImportError:
+    HAS_CV2 = False
+
 try:
     import av
     from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, AudioProcessorBase, WebRtcMode, RTCConfiguration
-    HAS_DEPS = True
-except ImportError as e:
-    HAS_DEPS = False
+except ImportError:
+    HAS_WEBRTC = False
     # Define dummy variables to prevent 'NameError' if execution slips through
     RTCConfiguration = None
     WebRtcMode = None
     webrtc_streamer = None
 
+HAS_DEPS = HAS_CV2 and HAS_WEBRTC
+
 # Stop execution if dependencies are missing
 if not HAS_DEPS:
     st.title("🚨 Missing Dependencies")
-    st.error("The app requires 'av' and 'streamlit-webrtc' to run.")
-    st.markdown("### Please run the following command in your terminal:")
-    st.code("pip install av streamlit-webrtc", language="bash")
+    st.error("The app requires 'opencv-python-headless', 'av', and 'streamlit-webrtc' to run.")
+    st.markdown("### To fix this, please ensure a `requirements.txt` file exists in your GitHub repository and contains:")
+    st.code("""
+streamlit
+streamlit-webrtc
+opencv-python-headless
+numpy
+scipy
+plotly
+""", language="text")
+    st.markdown("And ensure your app is run with `streamlit run app.py` (or `streamlit run iot.py`).")
     
-    # If running in standard python console, print and exit to prevent crash
-    print("\n🚨 CRITICAL ERROR: Missing libraries 'av' or 'streamlit-webrtc'.")
-    print(">> Run: pip install av streamlit-webrtc\n")
+    # Inform users running outside Streamlit run
+    print("\n🚨 CRITICAL ERROR: Missing libraries.")
+    print(">> Action: Create requirements.txt and deploy again.\n")
     
     try:
         st.stop() # Stops Streamlit execution
     except Exception:
         sys.exit(1) # Stops Python script execution
+
+# Ensure numpy is imported after checks, although it's almost always installed with Streamlit
+import numpy as np
+
 
 # ==========================================
 # 1. CONFIGURATION & STYLING
@@ -143,6 +163,7 @@ class MediaProcessor:
         self.green_buffer.append(g_mean)
         
         if len(self.green_buffer) > 30:
+            # Simplified PPG calculation
             return int(70 + (np.std(self.green_buffer) % 40)) 
         return 0
 
@@ -160,6 +181,7 @@ class MediaProcessor:
         return min(movement_score, 100)
 
     def process_breathing(self, frame):
+        # Mock breathing signal
         return 20 + np.random.randint(-2, 3)
 
 # WebRTC Video Callback
@@ -174,6 +196,7 @@ def video_frame_callback(frame: av.VideoFrame):
         if config["heart_rate"]:
             bpm = processor.process_heart_rate(img)
             h, w, _ = img.shape
+            # Draw ROI on video stream for feedback
             cv2.rectangle(img, (w//2-50, h//2-50), (w//2+50, h//2+50), (0, 255, 0), 2)
             
         if config["movement"]:
@@ -201,6 +224,7 @@ def audio_frame_callback(frame: av.AudioFrame):
     is_crying = False
     
     if config["is_active"] and config["cry_detection"]:
+        # Simple Cry Detection based on Root Mean Square (RMS) volume
         rms = np.sqrt(np.mean(sound**2))
         if rms > 1000:
             is_crying = True
@@ -278,8 +302,7 @@ def mobile_sensor_page():
             )
     else:
         st.warning("⚠️ Waiting for Laptop Operator to Start Analysis...")
-
-    if not config["is_active"]:
+        # Force a rerun to check for state change without user interaction
         time.sleep(2)
         st.rerun()
 
@@ -306,7 +329,7 @@ def laptop_dashboard_page():
                 "cry_detection": cry_en,
                 "is_active": True
             })
-            st.toast("Analysis Started!", icon="🚀")
+            st.toast("Analysis Started! Mobile unit should activate.", icon="🚀")
             
         if col_stop.button("⏹ Stop"):
             state_manager.update_config({"is_active": False})
@@ -321,20 +344,24 @@ def laptop_dashboard_page():
         st.info("System is IDLE. Select sensors and click 'Start Analysis' in the sidebar.")
         return
 
-    # Status Logic
+    # Status Logic and Alerts
     alerts = []
+    
+    # Heart Rate Status
     bpm_status = "status-normal"
-    if live["bpm"] < 90 or live["bpm"] > 160:
+    if config["heart_rate"] and (live["bpm"] < 90 or live["bpm"] > 160):
         bpm_status = "status-critical"
         if live["bpm"] > 0: alerts.append(f"CRITICAL: Abnormal Heart Rate ({live['bpm']} BPM)")
     
+    # Movement Status
     mv_status = "status-normal"
-    if live["movement_level"] > 20: 
+    if config["movement"] and live["movement_level"] > 20: 
         mv_status = "status-warning"
         alerts.append("WARNING: High Movement Detected")
         
+    # Cry Detection Status
     cry_status = "status-normal"
-    if live["is_crying"]:
+    if config["cry_detection"] and live["is_crying"]:
         cry_status = "status-critical"
         alerts.append("ALERT: Crying Detected!")
 
@@ -356,17 +383,31 @@ def laptop_dashboard_page():
     # Charts
     st.markdown("### 📈 Live Trends")
     fig = go.Figure()
-    if config["heart_rate"]:
-        fig.add_trace(go.Scatter(y=list(hist["bpm"]), mode='lines', name='Heart Rate', line=dict(color='red')))
-    if config["breathing"]:
-        fig.add_trace(go.Scatter(y=list(hist["breathing"]), mode='lines', name='Breathing', line=dict(color='blue')))
-    if config["movement"]:
-        scaled_mv = [x * 5 for x in hist["movement"]]
+    
+    # --- PLOT FIX APPLIED HERE: Check for data before plotting ---
+    
+    if config["heart_rate"] and hist["bpm"]:
+        # Use np.array for robust plotting against Plotly's type checks
+        fig.add_trace(go.Scatter(y=np.array(hist["bpm"]), mode='lines', name='Heart Rate', line=dict(color='red')))
+        
+    if config["breathing"] and hist["breathing"]:
+        fig.add_trace(go.Scatter(y=np.array(hist["breathing"]), mode='lines', name='Breathing', line=dict(color='blue')))
+        
+    if config["movement"] and hist["movement"]:
+        # Scale movement for visibility
+        scaled_mv = np.array(hist["movement"]) * 5
         fig.add_trace(go.Scatter(y=scaled_mv, mode='lines', name='Movement (x5)', line=dict(color='orange', dash='dot')))
 
-    fig.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20), legend=dict(orientation="h", y=1.1))
+    fig.update_layout(
+        height=350, 
+        margin=dict(l=20, r=20, t=20, b=20), 
+        yaxis_title="Sensor Values",
+        xaxis_title="Time (Last 100 Readings)",
+        legend=dict(orientation="h", y=1.1)
+    )
     st.plotly_chart(fig, use_container_width=True)
 
+    # Auto-refresh loop for Dashboard
     time.sleep(1)
     st.rerun()
 
@@ -380,12 +421,14 @@ def main():
     if not st.session_state["logged_in"]:
         login_page()
     else:
+        # Logout button header
         c1, c2 = st.columns([8,1])
         with c2:
             if st.button("Logout"):
                 st.session_state["logged_in"] = False
                 st.rerun()
         
+        # Router
         if st.session_state["role"] == "Laptop Operator (Monitor)":
             laptop_dashboard_page()
         else:
