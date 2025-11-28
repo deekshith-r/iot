@@ -175,7 +175,10 @@ class MediaProcessor:
         if self.prev_gray is not None:
             delta_frame = cv2.absdiff(self.prev_gray, gray)
             thresh = cv2.threshold(delta_frame, 25, 255, cv2.THRESH_BINARY)[1]
-            movement_score = np.sum(thresh) / 10000 
+            
+            # *** SENSITIVITY INCREASED FOR MINUTE MOVEMENTS ***
+            # Normalized by 5000 instead of 10000
+            movement_score = np.sum(thresh) / 5000 
             
         self.prev_gray = gray
         return min(movement_score, 100)
@@ -190,6 +193,9 @@ def video_frame_callback(frame: av.VideoFrame):
     config = state_manager.get_config()
     
     bpm, movement, breathing = 0, 0, 0
+    # NOTE: MediaProcessor should ideally be a singleton if it holds state (like self.prev_gray)
+    # For Streamlit WebRTC processing, the processor is typically instantiated per frame/chunk,
+    # so we rely on the SharedDataManager for overall state and history.
     processor = MediaProcessor() 
 
     if config["is_active"]:
@@ -226,7 +232,10 @@ def audio_frame_callback(frame: av.AudioFrame):
     if config["is_active"] and config["cry_detection"]:
         # Simple Cry Detection based on Root Mean Square (RMS) volume
         rms = np.sqrt(np.mean(sound**2))
-        if rms > 1000:
+        
+        # *** SENSITIVITY INCREASED FOR MINUTE SOUNDS ***
+        # Lower threshold (500 instead of 1000) makes it more sensitive
+        if rms > 500: 
             is_crying = True
             
         current_readings = state_manager.get_data()["live"]
@@ -261,7 +270,7 @@ def login_page():
 # ==========================================
 def mobile_sensor_page():
     st.markdown(f"### 📱 Sensor Unit | Logged in as: {st.session_state['user']}")
-    st.info("Place this device near the neonate. Ensure camera points at the chest/face.")
+    st.info("Place this device near the neonate, ideally stabilized on a tripod or stand.")
     
     config = state_manager.get_config()
     
@@ -291,9 +300,10 @@ def mobile_sensor_page():
     if config["is_active"]:
         st.success("✅ Analysis Active - Streaming Data...")
         if HAS_DEPS:
+            # Change mode to SENDRECV to allow the Laptop Dashboard to receive the video stream
             webrtc_streamer(
                 key="neonatal-sensor",
-                mode=WebRtcMode.SENDONLY,
+                mode=WebRtcMode.SENDRECV,
                 rtc_configuration=RTC_CONFIGURATION,
                 video_frame_callback=video_frame_callback,
                 audio_frame_callback=audio_frame_callback,
@@ -333,6 +343,7 @@ def laptop_dashboard_page():
             
         if col_stop.button("⏹ Stop"):
             state_manager.update_config({"is_active": False})
+            state_manager.update_config({"is_active": False}) # Ensure config is immediately updated
             st.toast("Analysis Stopped.")
 
     data = state_manager.get_data()
@@ -343,6 +354,18 @@ def laptop_dashboard_page():
     if not config["is_active"]:
         st.info("System is IDLE. Select sensors and click 'Start Analysis' in the sidebar.")
         return
+
+    # --- Live Video Stream ---
+    st.markdown("### 👁️ Live Mobile Feed (Monitor View)")
+    # This element receives the stream from the mobile sensor page
+    webrtc_streamer(
+        key="neonatal-monitor-viewer",
+        mode=WebRtcMode.RECVONLY, # Receive mode to display mobile camera
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={"video": True, "audio": False}, # Video only for display
+    )
+    st.divider()
+
 
     # Status Logic and Alerts
     alerts = []
@@ -357,7 +380,7 @@ def laptop_dashboard_page():
     mv_status = "status-normal"
     if config["movement"] and live["movement_level"] > 20: 
         mv_status = "status-warning"
-        alerts.append("WARNING: High Movement Detected")
+        alerts.append("WARNING: High Movement Detected (Score: {live['movement_level']:.1f})")
         
     # Cry Detection Status
     cry_status = "status-normal"
@@ -370,6 +393,7 @@ def laptop_dashboard_page():
             st.error(alert)
 
     # Live Cards
+    st.markdown("### 📊 Real-Time Metrics")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(f"""<div class="metric-card {bpm_status}"><h3>Heart Rate</h3><h1>{live['bpm']}</h1></div>""", unsafe_allow_html=True)
@@ -383,8 +407,6 @@ def laptop_dashboard_page():
     # Charts
     st.markdown("### 📈 Live Trends")
     fig = go.Figure()
-    
-    # --- PLOT FIX APPLIED HERE: Check for data before plotting ---
     
     if config["heart_rate"] and hist["bpm"]:
         # Use np.array for robust plotting against Plotly's type checks
@@ -408,6 +430,7 @@ def laptop_dashboard_page():
     st.plotly_chart(fig, use_container_width=True)
 
     # Auto-refresh loop for Dashboard
+    # Important: This keeps the dashboard updating in real-time, pulling data from the shared state
     time.sleep(1)
     st.rerun()
 
@@ -425,6 +448,7 @@ def main():
         c1, c2 = st.columns([8,1])
         with c2:
             if st.button("Logout"):
+                state_manager.update_config({"is_active": False}) # Stop analysis on logout
                 st.session_state["logged_in"] = False
                 st.rerun()
         
