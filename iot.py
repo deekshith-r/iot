@@ -1,63 +1,33 @@
 import streamlit as st
+import cv2
+import numpy as np
 import threading
 import time
-import queue
 import collections
 import plotly.graph_objs as go
 import sys
 
 # ==========================================
-# 0. DEPENDENCY CHECK
+# 0. DEPENDENCY CHECK & IMPORTS
 # ==========================================
-# We wrap imports to handle missing libraries gracefully and prevent NameErrors
-HAS_CV2 = True
-HAS_WEBRTC = True
-
-try:
-    # We use opencv-python-headless in the requirements for deployment stability
-    import cv2 
-except ImportError:
-    HAS_CV2 = False
-
 try:
     import av
-    from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, AudioProcessorBase, WebRtcMode, RTCConfiguration
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+    HAS_DEPS = True
 except ImportError:
-    HAS_WEBRTC = False
-    # Define dummy variables to prevent 'NameError' if execution slips through
+    HAS_DEPS = False
     RTCConfiguration = None
     WebRtcMode = None
     webrtc_streamer = None
 
-HAS_DEPS = HAS_CV2 and HAS_WEBRTC
-
-# Stop execution if dependencies are missing
 if not HAS_DEPS:
     st.title("🚨 Missing Dependencies")
-    st.error("The app requires 'opencv-python-headless', 'av', and 'streamlit-webrtc' to run.")
-    st.markdown("### To fix this, please ensure a `requirements.txt` file exists in your GitHub repository and contains:")
-    st.code("""
-streamlit
-streamlit-webrtc
-opencv-python-headless
-numpy
-scipy
-plotly
-""", language="text")
-    st.markdown("And ensure your app is run with `streamlit run app.py` (or `streamlit run iot.py`).")
-    
-    # Inform users running outside Streamlit run
-    print("\n🚨 CRITICAL ERROR: Missing libraries.")
-    print(">> Action: Create requirements.txt and deploy again.\n")
-    
+    st.error("The app requires 'av' and 'streamlit-webrtc' to run.")
+    st.code("pip install av streamlit-webrtc", language="bash")
     try:
-        st.stop() # Stops Streamlit execution
+        st.stop()
     except Exception:
-        sys.exit(1) # Stops Python script execution
-
-# Ensure numpy is imported after checks, although it's almost always installed with Streamlit
-import numpy as np
-
+        sys.exit(1)
 
 # ==========================================
 # 1. CONFIGURATION & STYLING
@@ -82,13 +52,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# RTC Configuration for remote connectivity (STUN servers)
-if HAS_DEPS and RTCConfiguration:
-    RTC_CONFIGURATION = RTCConfiguration(
-        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-    )
-else:
-    RTC_CONFIGURATION = None
+# RTC Configuration (Essential for camera/mic access over the web)
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
 # ==========================================
 # 2. SHARED SERVER STATE (Simulates DB)
@@ -97,14 +64,6 @@ else:
 class SharedDataManager:
     def __init__(self):
         self._lock = threading.Lock()
-        
-        # Initialize history with one zero to ensure Plotly renders immediately
-        initial_history = {
-            "bpm": collections.deque([0], maxlen=100),
-            "breathing": collections.deque([0], maxlen=100),
-            "movement": collections.deque([0], maxlen=100)
-        }
-        
         self.data_store = {
             "sensor_config": {
                 "heart_rate": False,
@@ -118,10 +77,13 @@ class SharedDataManager:
                 "breathing_rate": 0,
                 "movement_level": 0,
                 "is_crying": False,
-                "timestamp": 0,
-                "live_rms": 0 # Track live RMS for better audio feedback
+                "timestamp": 0
             },
-            "history": initial_history
+            "history": {
+                "bpm": collections.deque(maxlen=100),
+                "breathing": collections.deque(maxlen=100),
+                "movement": collections.deque(maxlen=100)
+            }
         }
 
     def update_config(self, config):
@@ -134,26 +96,23 @@ class SharedDataManager:
 
     def update_readings(self, readings):
         with self._lock:
-            # Preserve history state during update
-            hist = self.data_store["history"]
+            # Update live readings
+            self.data_store["live_readings"] = readings
             
-            self.data_store["live_readings"].update(readings)
-
-            # Only append if the corresponding sensor is configured to run (to prevent adding 0s unnecessarily)
-            if self.data_store["sensor_config"]["heart_rate"]:
-                hist["bpm"].append(readings.get("bpm", 0))
-            if self.data_store["sensor_config"]["breathing"]:
-                hist["breathing"].append(readings.get("breathing_rate", 0))
-            if self.data_store["sensor_config"]["movement"]:
-                hist["movement"].append(readings.get("movement_level", 0))
-
+            # Update history only if the sensor is enabled (non-zero reading)
+            if readings["bpm"] > 0:
+                self.data_store["history"]["bpm"].append(readings["bpm"])
+            if readings["breathing_rate"] > 0:
+                self.data_store["history"]["breathing"].append(readings["breathing_rate"])
+            if readings["movement_level"] > 0:
+                self.data_store["history"]["movement"].append(readings["movement_level"])
 
     def get_data(self):
         with self._lock:
             return {
-                "live": self.data_store["live_readings"].copy(),
+                "live": self.data_store["live_readings"],
                 "history": self.data_store["history"],
-                "config": self.data_store["sensor_config"].copy()
+                "config": self.data_store["sensor_config"]
             }
 
 state_manager = SharedDataManager()
@@ -163,84 +122,132 @@ state_manager = SharedDataManager()
 # ==========================================
 class MediaProcessor:
     def __init__(self):
-        # NOTE: For Streamlit, self.prev_gray is problematic as a processor is instantiated per frame.
-        # We accept a slightly less accurate movement reading for this architecture constraint.
-        pass
-        
+        # rPPG Buffer: Green channel averages (5 seconds @ ~30 FPS)
+        self.green_buffer = collections.deque(maxlen=150) 
+        # Optical Flow for breathing
+        self.prev_points = None
+        self.prev_gray = None
+        self.frame_count = 0
+    
     def process_heart_rate(self, frame):
+        # 1. Select Region of Interest (ROI) for skin
         h, w, _ = frame.shape
         roi = frame[h//2-50:h//2+50, w//2-50:w//2+50]
         
         if roi.size == 0: return 0
-        g_mean = np.mean(roi[:, :, 1])
         
-        # We rely on the global deque inside the Video Callback for signal processing buffer
-        # In a single-file Streamlit app, we have to cheat and grab the global history deque
-        global_history = state_manager.get_data()["history"]["bpm"]
-        global_history.append(g_mean)
-
-        if len(global_history) > 30:
-            # Simplified PPG calculation based on signal fluctuation
-            # Using the last 30 frames for a quick mock BPM estimate
-            signal_window = np.array(list(global_history)[-30:])
-            # A simple simulation that changes the BPM based on noise/signal variance
-            return int(70 + (np.std(signal_window) * 5)) 
+        # 2. Average the green channel (most sensitive to blood flow)
+        g_mean = np.mean(roi[:, :, 1])
+        self.green_buffer.append(g_mean)
+        
+        # 3. Simple rPPG simulation: requires enough data (e.g., 5 seconds)
+        if len(self.green_buffer) > 100:
+            # Detrend the signal (subtract a mean baseline)
+            detrended_signal = self.green_buffer - np.mean(self.green_buffer)
+            
+            # Simple simulation: BPM is inversely proportional to signal stability 
+            # and proportional to variance over a window
+            variance = np.var(detrended_signal)
+            
+            # Scale variance to a reasonable BPM range (90-160 for neonates)
+            # This is a very rough simulation; real rPPG uses FFT
+            simulated_bpm = int(90 + (variance * 1000) % 70) 
+            
+            return max(90, min(simulated_bpm, 180)) # Clamp to a realistic range
         return 0
 
-    def process_movement(self, frame, prev_gray):
+    def process_breathing(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        
+        # Define a small ROI around the chest/abdomen for breathing movement
+        roi_x, roi_y = w//2 - 20, h//2 - 40
+        roi_w, roi_h = 40, 80
+        roi = gray[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+
+        # Use optical flow to track vertical movement (breathing)
+        if self.prev_gray is not None and roi.size > 0:
+            # Find corners to track
+            p0 = cv2.goodFeaturesToTrack(roi, mask = None, maxCorners = 20, qualityLevel = 0.3, minDistance = 7, blockSize = 7)
+            
+            if p0 is not None:
+                if self.prev_points is not None:
+                    # Calculate optical flow
+                    p1, st, err = cv2.calcKLT(self.prev_gray[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w], roi, self.prev_points, None, winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+                    
+                    if p1 is not None and st is not None:
+                        # Select only successful points
+                        good_new = p1[st==1]
+                        good_old = self.prev_points[st==1]
+                        
+                        # Calculate vertical displacement (Y-axis)
+                        dy = np.mean(good_new[:, 1] - good_old[:, 1]) if len(good_new) > 0 else 0
+                        
+                        # Simulate breathing rate: average movement magnitude
+                        # Actual breathing rate requires FFT on the displacement signal
+                        
+                        # Store points for next frame
+                        self.prev_points = good_new.reshape(-1, 1, 2)
+                        
+                        # Simulate breathing rate (15-40 breaths/min for neonate)
+                        # Scale displacement into a rate:
+                        simulated_rate = int(20 + abs(dy) * 5)
+                        return max(15, min(simulated_rate, 40))
+
+                # Initialize tracking points
+                self.prev_points = p0
+        
+        self.prev_gray = roi.copy()
+        return 0
+
+    def process_movement(self, frame):
+        # Uses frame differencing across the entire frame for gross motion detection
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (21, 21), 0)
         
         movement_score = 0
-        if prev_gray is not None:
-            # Simple optical flow / frame differencing
-            delta_frame = cv2.absdiff(prev_gray, gray)
-            thresh = cv2.threshold(delta_frame, 20, 255, cv2.THRESH_BINARY)[1] # Lower threshold (20) for sensitivity
+        if self.prev_gray is not None:
+            # Use the full frame for motion detection here
+            delta_frame = cv2.absdiff(self.prev_gray, gray)
+            thresh = cv2.threshold(delta_frame, 25, 255, cv2.THRESH_BINARY)[1]
             
-            # *** SENSITIVITY INCREASED FOR MINUTE MOVEMENTS ***
-            # Normalized by 5000 instead of 10000 -> higher score for same movement
-            movement_score = np.sum(thresh) / 5000 
+            # Movement score is the count of significant pixel changes
+            movement_score = np.sum(thresh) / 10000 
             
-        return min(movement_score, 100), gray
+        self.prev_gray = gray
+        return min(movement_score, 100)
 
-    def process_breathing(self, frame):
-        # Mock breathing signal, as accurate optical flow for respiration requires stable conditions
-        return 20 + np.random.randint(-2, 3)
-
-# Global state for movement processing (must be outside the callback)
-_prev_gray_frame = None
+# Global processor instance for continuity
+processor = MediaProcessor() 
 
 # WebRTC Video Callback
 def video_frame_callback(frame: av.VideoFrame):
-    global _prev_gray_frame
-    
     img = frame.to_ndarray(format="bgr24")
     config = state_manager.get_config()
     
     bpm, movement, breathing = 0, 0, 0
-    processor = MediaProcessor() 
 
     if config["is_active"]:
+        # 1. Run Analysis
         if config["heart_rate"]:
             bpm = processor.process_heart_rate(img)
+            # Annotate ROI for rPPG
             h, w, _ = img.shape
-            # Draw ROI on video stream for feedback
             cv2.rectangle(img, (w//2-50, h//2-50), (w//2+50, h//2+50), (0, 255, 0), 2)
             
         if config["movement"]:
-            # Pass the global previous frame for continuity
-            movement, _prev_gray_frame = processor.process_movement(img, _prev_gray_frame)
+            movement = processor.process_movement(img)
             
         if config["breathing"]:
             breathing = processor.process_breathing(img)
 
+        # 2. Update Shared State
         current_readings = state_manager.get_data()["live"]
         new_readings = {
             "bpm": bpm if config["heart_rate"] else 0,
             "breathing_rate": breathing if config["breathing"] else 0,
             "movement_level": movement if config["movement"] else 0,
-            "is_crying": current_readings["is_crying"],
-            "live_rms": current_readings["live_rms"],
+            "is_crying": current_readings["is_crying"], # Audio state maintained
             "timestamp": time.time()
         }
         state_manager.update_readings(new_readings)
@@ -251,32 +258,26 @@ def video_frame_callback(frame: av.VideoFrame):
 def audio_frame_callback(frame: av.AudioFrame):
     sound = frame.to_ndarray()
     config = state_manager.get_config()
+    
+    # Placeholder for simple cry detection
     is_crying = False
     
-    current_readings = state_manager.get_data()["live"]
-    
     if config["is_active"] and config["cry_detection"]:
-        # Simple Cry Detection based on Root Mean Square (RMS) volume
         rms = np.sqrt(np.mean(sound**2))
-        
-        # *** SENSITIVITY INCREASED FOR MINUTE SOUNDS ***
-        # Lower threshold (500 instead of 1000) makes it more sensitive
-        if rms > 500: 
+        # Simple threshold for loud noise/cry
+        if rms > 1500: 
             is_crying = True
             
-        # Update shared state with live status and RMS value
-        new_audio_readings = {
-            "is_crying": is_crying,
-            "live_rms": rms
-        }
-        # Merge audio update with existing video/sensor data
-        current_readings.update(new_audio_readings)
+        # Update the cry status in the shared state
+        current_readings = state_manager.get_data()["live"]
+        current_readings["is_crying"] = is_crying
+        current_readings["timestamp"] = time.time() # Ensure time updates
         state_manager.update_readings(current_readings)
         
-    return frame
+    return frame # Return the frame unchanged
 
 # ==========================================
-# 4. PAGE: LOGIN
+# 4. PAGE: LOGIN & ROUTING
 # ==========================================
 def login_page():
     st.markdown("## 🏥 Neonatal Health Monitoring Login")
@@ -301,7 +302,7 @@ def login_page():
 # ==========================================
 def mobile_sensor_page():
     st.markdown(f"### 📱 Sensor Unit | Logged in as: {st.session_state['user']}")
-    st.info("Place this device near the neonate, ideally stabilized on a tripod or stand.")
+    st.info("Place this device near the neonate. Requires camera and microphone access.")
     
     config = state_manager.get_config()
     
@@ -312,38 +313,21 @@ def mobile_sensor_page():
     c3.metric("Motion", "ON" if config["movement"] else "OFF")
     c4.metric("Cry", "ON" if config["cry_detection"] else "OFF")
 
-    # JS for Accelerometer Permission
-    st.markdown("""
-    <script>
-    if (typeof DeviceMotionEvent.requestPermission === 'function') {
-      DeviceMotionEvent.requestPermission()
-        .then(permissionState => {
-          if (permissionState === 'granted') {
-            window.addEventListener('devicemotion', () => {});
-          }
-        })
-        .catch(console.error);
-    }
-    </script>
-    """, unsafe_allow_html=True)
-    
     # WebRTC Streamer
     if config["is_active"]:
         st.success("✅ Analysis Active - Streaming Data...")
-        if HAS_DEPS:
-            # SENDRECV mode allows the Laptop Dashboard to receive the video stream
-            webrtc_streamer(
-                key="neonatal-sensor",
-                mode=WebRtcMode.SENDRECV,
-                rtc_configuration=RTC_CONFIGURATION,
-                video_frame_callback=video_frame_callback,
-                audio_frame_callback=audio_frame_callback,
-                media_stream_constraints={"video": True, "audio": True},
-                async_processing=True,
-            )
+        webrtc_streamer(
+            key="neonatal-sensor",
+            mode=WebRtcMode.SENDONLY,
+            rtc_configuration=RTC_CONFIGURATION,
+            video_frame_callback=video_frame_callback,
+            audio_frame_callback=audio_frame_callback,
+            media_stream_constraints={"video": True, "audio": True},
+            async_processing=True,
+        )
     else:
         st.warning("⚠️ Waiting for Laptop Operator to Start Analysis...")
-        # Force a rerun to check for state change without user interaction
+        # Automatically re-run to check config status from the Laptop Operator
         time.sleep(2)
         st.rerun()
 
@@ -353,15 +337,20 @@ def mobile_sensor_page():
 def laptop_dashboard_page():
     st.markdown(f"### 💻 Monitoring Dashboard | Logged in as: {st.session_state['user']}")
     
+    # 1. Sidebar Configuration
     with st.sidebar:
         st.header("Sensor Configuration")
-        hr_en = st.checkbox("Heart Rate (PPG)", value=True)
-        br_en = st.checkbox("Breathing Rate", value=True)
-        mv_en = st.checkbox("Movement (Cam + Acc)", value=True)
-        cry_en = st.checkbox("Cry Detection (Audio)", value=True)
+        # Ensure checkboxes reflect current config, especially after a stop/start
+        current_config = state_manager.get_config()
+        hr_en = st.checkbox("Heart Rate (rPPG)", value=current_config.get("heart_rate", True))
+        br_en = st.checkbox("Breathing Rate (Motion)", value=current_config.get("breathing", True))
+        mv_en = st.checkbox("Movement (Optical Flow)", value=current_config.get("movement", True))
+        cry_en = st.checkbox("Cry Detection (Audio)", value=current_config.get("cry_detection", True))
         
         st.divider()
         col_start, col_stop = st.columns(2)
+        
+        # START Button logic
         if col_start.button("▶ Start Analysis", type="primary"):
             state_manager.update_config({
                 "heart_rate": hr_en,
@@ -370,8 +359,9 @@ def laptop_dashboard_page():
                 "cry_detection": cry_en,
                 "is_active": True
             })
-            st.toast("Analysis Started! Mobile unit should activate.", icon="🚀")
+            st.toast("Analysis Started! Sensor unit must now connect.", icon="🚀")
             
+        # STOP Button logic
         if col_stop.button("⏹ Stop"):
             state_manager.update_config({"is_active": False})
             st.toast("Analysis Stopped.")
@@ -385,85 +375,67 @@ def laptop_dashboard_page():
         st.info("System is IDLE. Select sensors and click 'Start Analysis' in the sidebar.")
         return
 
-    # --- Live Video Stream ---
-    st.markdown("### 👁️ Live Mobile Feed (Monitor View)")
-    
-    # *** WEBRTC FIX APPLIED HERE: Changed mode to SENDRECV for compatibility ***
-    webrtc_streamer(
-        key="neonatal-monitor-viewer",
-        mode=WebRtcMode.SENDRECV, # Use SENDRECV to ensure connection handshake succeeds
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False}, # Video only for display
-    )
-    st.divider()
-
-
-    # Status Logic and Alerts
+    # 2. Status Logic & Alerts
     alerts = []
     
-    # Heart Rate Status
     bpm_status = "status-normal"
-    if config["heart_rate"] and (live["bpm"] < 90 or live["bpm"] > 160):
+    if live["bpm"] > 0 and (live["bpm"] < 90 or live["bpm"] > 160):
         bpm_status = "status-critical"
-        if live["bpm"] > 0: alerts.append(f"CRITICAL: Abnormal Heart Rate ({live['bpm']} BPM)")
+        alerts.append(f"CRITICAL: Abnormal Heart Rate ({live['bpm']} BPM)")
     
-    # Movement Status
     mv_status = "status-normal"
-    if config["movement"] and live["movement_level"] > 20: 
+    if live["movement_level"] > 20: 
         mv_status = "status-warning"
-        alerts.append(f"WARNING: High Movement Detected (Score: {live['movement_level']:.1f})")
+        alerts.append("WARNING: High Movement Detected")
         
-    # Cry Detection Status
     cry_status = "status-normal"
-    if config["cry_detection"] and live["is_crying"]:
+    if live["is_crying"]:
         cry_status = "status-critical"
-        alerts.append(f"ALERT: Crying Detected! (Loudness RMS: {live['live_rms']:.0f})")
+        alerts.append("🚨 ALERT: Crying Detected! Check on the neonate.")
 
     if alerts:
         for alert in alerts:
             st.error(alert)
 
-    # Live Cards
-    st.markdown("### 📊 Real-Time Metrics")
+    # 3. Live Metric Cards
+    st.markdown("### Live Readings")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown(f"""<div class="metric-card {bpm_status}"><h3>Heart Rate</h3><h1>{live['bpm']}</h1></div>""", unsafe_allow_html=True)
+        # Only display if HR is enabled
+        display_bpm = live['bpm'] if config["heart_rate"] else "N/A"
+        st.markdown(f"""<div class="metric-card {bpm_status}"><h3>Heart Rate (BPM)</h3><h1>{display_bpm}</h1></div>""", unsafe_allow_html=True)
     with c2:
-        st.markdown(f"""<div class="metric-card status-normal"><h3>Breathing</h3><h1>{live['breathing_rate']}</h1></div>""", unsafe_allow_html=True)
+        # Only display if Breathing is enabled
+        display_br = live['breathing_rate'] if config["breathing"] else "N/A"
+        st.markdown(f"""<div class="metric-card status-normal"><h3>Breathing Rate</h3><h1>{display_br}</h1></div>""", unsafe_allow_html=True)
     with c3:
-        st.markdown(f"""<div class="metric-card {mv_status}"><h3>Movement</h3><h1>{int(live['movement_level'])}</h1></div>""", unsafe_allow_html=True)
+        # Only display if Movement is enabled
+        display_mv = f"{int(live['movement_level'])}%" if config["movement"] else "N/A"
+        st.markdown(f"""<div class="metric-card {mv_status}"><h3>Movement Level</h3><h1>{display_mv}</h1></div>""", unsafe_allow_html=True)
     with c4:
-        st.markdown(f"""<div class="metric-card {cry_status}"><h3>Status</h3><h1>{'CRYING' if live['is_crying'] else 'CALM'}</h1></div>""", unsafe_allow_html=True)
+        # Only display if Cry Detection is enabled
+        cry_text = 'CRYING' if live['is_crying'] else 'CALM'
+        display_cry = cry_text if config["cry_detection"] else "N/A"
+        st.markdown(f"""<div class="metric-card {cry_status}"><h3>Status</h3><h1>{display_cry}</h1></div>""", unsafe_allow_html=True)
 
-    # Charts
-    st.markdown("### 📈 Live Trends")
+    # 4. Charts
+    st.markdown("### 📈 Live Trends (Last 100 updates)")
     fig = go.Figure()
     
-    # Data is guaranteed to have at least one 0 value now, preventing the Plotly crash
     if config["heart_rate"]:
-        # Use np.array for robust plotting against Plotly's type checks
-        fig.add_trace(go.Scatter(y=np.array(hist["bpm"]), mode='lines', name='Heart Rate', line=dict(color='red')))
-        
+        fig.add_trace(go.Scatter(y=list(hist["bpm"]), mode='lines', name='Heart Rate (BPM)', line=dict(color='red')))
     if config["breathing"]:
-        fig.add_trace(go.Scatter(y=np.array(hist["breathing"]), mode='lines', name='Breathing', line=dict(color='blue')))
-        
+        fig.add_trace(go.Scatter(y=list(hist["breathing"]), mode='lines', name='Breathing Rate', line=dict(color='blue')))
     if config["movement"]:
-        # Scale movement for visibility
-        scaled_mv = np.array(hist["movement"]) * 5
+        # Scale movement for visibility on the same chart
+        scaled_mv = [x * 5 for x in hist["movement"]]
         fig.add_trace(go.Scatter(y=scaled_mv, mode='lines', name='Movement (x5)', line=dict(color='orange', dash='dot')))
 
-    fig.update_layout(
-        height=350, 
-        margin=dict(l=20, r=20, t=20, b=20), 
-        yaxis_title="Sensor Values",
-        xaxis_title="Time (Last 100 Readings)",
-        legend=dict(orientation="h", y=1.1)
-    )
+    fig.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20), legend=dict(orientation="h", y=1.1))
     st.plotly_chart(fig, use_container_width=True)
 
-    # Auto-refresh loop for Dashboard
-    # Important: This keeps the dashboard updating in real-time, pulling data from the shared state
-    time.sleep(1)
+    # 5. Continuous Refresh (Streamlit's way of real-time update)
+    time.sleep(1) # Refresh every 1 second
     st.rerun()
 
 # ==========================================
@@ -476,15 +448,14 @@ def main():
     if not st.session_state["logged_in"]:
         login_page()
     else:
-        # Logout button header
+        # Add Logout button for easy switching/exit
         c1, c2 = st.columns([8,1])
         with c2:
             if st.button("Logout"):
-                state_manager.update_config({"is_active": False}) # Stop analysis on logout
                 st.session_state["logged_in"] = False
                 st.rerun()
         
-        # Router
+        # Route to the appropriate page
         if st.session_state["role"] == "Laptop Operator (Monitor)":
             laptop_dashboard_page()
         else:
