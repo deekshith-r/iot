@@ -1,348 +1,271 @@
 import streamlit as st
 import cv2
 import numpy as np
-import threading
-import time
-import collections
-import plotly.graph_objs as go
 import tempfile
-import sys
-from scipy.signal import find_peaks
+import plotly.graph_objs as go
+from scipy.signal import find_peaks, savgol_filter
+import os
 
 # ==========================================
-# 0. DEPENDENCY CHECK
+# 1. SETUP
 # ==========================================
-try:
-    import av
-    from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
-except ImportError:
-    st.error("🚨 Critical Error: Missing dependencies. Please install: av, streamlit-webrtc, plotly, scipy")
-    st.stop()
+st.set_page_config(page_title="Clinical Breath Analyzer", layout="wide", page_icon="🫁")
 
-# ==========================================
-# 1. CONFIGURATION: 4K SUPPORT
-# ==========================================
-st.set_page_config(page_title="Neonatal AI Guard", layout="wide", page_icon="👶")
-
-# CSS for nice UI
 st.markdown("""
 <style>
-    .big-font { font-size:20px !important; }
-    .status-card { padding: 15px; border-radius: 10px; color: white; margin-bottom: 10px; }
-    .status-ok { background-color: #28a745; }
-    .status-warn { background-color: #ffc107; color: black; }
-    .status-crit { background-color: #dc3545; }
+    .main-header { font-size: 24px; font-weight: bold; margin-bottom: 20px; }
+    .stat-box { padding: 15px; border-radius: 8px; text-align: center; color: white; }
+    .stat-ok { background-color: #28a745; }
+    .stat-crit { background-color: #dc3545; }
+    .stat-warn { background-color: #ffc107; color: black; }
 </style>
 """, unsafe_allow_html=True)
 
-# 4K / HD Constraints for Mobile Camera
-MEDIA_CONSTRAINTS = {
-    "video": {
-        "width": {"min": 1280, "ideal": 3840, "max": 3840}, # Request 4K
-        "height": {"min": 720, "ideal": 2160, "max": 2160},
-        "frameRate": {"min": 24, "ideal": 30, "max": 60}, 
-    },
-    "audio": True
-}
-
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
-
 # ==========================================
-# 2. SHARED SERVER STATE
+# 2. ACCURATE PROCESSING ENGINE
 # ==========================================
-@st.cache_resource
-class SharedDataManager:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.data = {
-            "live_vitals": {"bpm": 0, "rr": 0, "cry": False, "status": "Waiting..."},
-            "latest_frame": None, # Stores the live video frame
-            "history": {
-                "bpm": collections.deque(maxlen=100),
-                "rr": collections.deque(maxlen=100)
-            }
-        }
-
-    def update(self, vitals, frame):
-        with self._lock:
-            self.data["live_vitals"] = vitals
-            # We resize frame slightly for storage efficiency if it's true 4K, 
-            # otherwise network lag will be massive. Keeping it HD (1080p) for display.
-            if frame is not None:
-                self.data["latest_frame"] = cv2.resize(frame, (1280, 720)) 
+def extract_breathing_signal(video_path):
+    """
+    Uses Optical Flow to track vertical chest movement with high precision.
+    Returns: Signal array, FPS, Duration
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    if fps == 0: fps = 30 # Fallback
+    
+    # Read first frame to select ROI (Region of Interest)
+    ret, prev_frame = cap.read()
+    if not ret: return [], 0, 0
+    
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    h, w = prev_gray.shape
+    
+    # FOCUS AREA: Center of the chest (middle 40% of screen)
+    # This ignores head movement and background noise
+    roi_x, roi_y, roi_w, roi_h = int(w*0.3), int(h*0.3), int(w*0.4), int(h*0.4)
+    
+    motion_signal = []
+    
+    # Progress Bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    status_text.text("🔍 Analyzing chest movement via Optical Flow...")
+    
+    frame_count = 0
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Calculate Optical Flow (Dense) only in the ROI
+        # This gives us flow_x (horizontal) and flow_y (vertical) movement for every pixel
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_gray[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w], 
+            gray[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w], 
+            None, 0.5, 3, 15, 3, 5, 1.2, 0
+        )
+        
+        # We only care about VERTICAL (Y) movement for breathing
+        # Summing absolute vertical changes captures the expansion/contraction intensity
+        vertical_motion = np.mean(np.abs(flow[..., 1]))
+        motion_signal.append(vertical_motion)
+        
+        prev_gray = gray
+        frame_count += 1
+        
+        if frame_count % 10 == 0:
+            progress_bar.progress(min(frame_count / total_frames, 1.0))
             
-            # Update history
-            if vitals["bpm"] > 0: self.data["history"]["bpm"].append(vitals["bpm"])
-            if vitals["rr"] > 0: self.data["history"]["rr"].append(vitals["rr"])
+    cap.release()
+    status_text.empty()
+    progress_bar.empty()
+    
+    return np.array(motion_signal), fps, total_frames / fps
 
-    def get(self):
-        with self._lock:
-            return self.data.copy()
-
-db = SharedDataManager()
-
-# ==========================================
-# 3. ADVANCED SIGNAL PROCESSING (FFT)
-# ==========================================
-class VitalSignProcessor:
-    def __init__(self):
-        self.green_buf = collections.deque(maxlen=300)
-        self.breath_buf = collections.deque(maxlen=300)
-        self.fps_est = 30
-        self.last_t = time.time()
-
-    def process(self, frame):
-        # FPS Calculation
-        curr_t = time.time()
-        dt = curr_t - self.last_t
-        if dt > 0: self.fps_est = 0.9 * self.fps_est + 0.1 * (1/dt)
-        self.last_t = curr_t
-
-        h, w, _ = frame.shape
-        
-        # 1. Breathing (Chest ROI)
-        # Center-Bottom Region
-        y1, y2 = int(h*0.4), int(h*0.8)
-        x1, x2 = int(w*0.3), int(w*0.7)
-        roi_breath = frame[y1:y2, x1:x2]
-        gray_breath = cv2.cvtColor(roi_breath, cv2.COLOR_BGR2GRAY)
-        breath_val = np.mean(gray_breath)
-        self.breath_buf.append(breath_val)
-
-        # 2. Heart Rate (Forehead ROI)
-        # Top-Center Region
-        fy1, fy2 = int(h*0.1), int(h*0.3)
-        fx1, fx2 = int(w*0.4), int(w*0.6)
-        roi_face = frame[fy1:fy2, fx1:fx2]
-        
-        if roi_face.size > 0:
-            g_mean = np.mean(roi_face[:, :, 1])
-            self.green_buf.append(g_mean)
-            cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2) # HR Box
-
-        # Draw Breathing Box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2) # RR Box
-
-        # 3. Compute Rates
-        hr = self._compute_fft(list(self.green_buf), 0.8, 3.0) # 48-180 bpm
-        rr = self._compute_fft(list(self.breath_buf), 0.2, 1.0) # 12-60 bpm
-
-        return frame, int(hr), int(rr)
-
-    def _compute_fft(self, data, min_hz, max_hz):
-        if len(data) < 60: return 0
-        y = np.array(data)
-        y = y - np.mean(y) # Detrend
-        n = len(y)
-        freqs = np.fft.rfftfreq(n, d=1/self.fps_est)
-        mag = np.abs(np.fft.rfft(y))
-        
-        mask = (freqs >= min_hz) & (freqs <= max_hz)
-        if not np.any(mask): return 0
-        
-        peak_idx = np.argmax(mag[mask])
-        return freqs[mask][peak_idx] * 60
-
-processor = VitalSignProcessor()
-
-# ==========================================
-# 4. WEBRTC CALLBACKS
-# ==========================================
-def video_frame_callback(frame: av.VideoFrame):
+def process_audio(video_path):
+    """
+    Extracts audio amplitude envelope to detect crying/gasps.
+    """
     try:
-        img = frame.to_ndarray(format="bgr24")
-    except: return frame
-
-    # ANALYZE
-    proc_img, hr, rr = processor.process(img)
-    
-    # PREDICT STATUS
-    status = "Optimal"
-    if rr > 60: status = "Tachypnea (High RR)"
-    if hr > 180: status = "Tachycardia (High HR)"
-    if hr < 90 and hr > 0: status = "Bradycardia (Low HR)"
-
-    # UPDATE SHARED DB
-    # We pass the processed image to the DB so the laptop sees the boxes/analysis
-    current_audio = db.get()["live_vitals"]["cry"] # Keep audio state
-    
-    db.update({
-        "bpm": hr,
-        "rr": rr,
-        "cry": current_audio,
-        "status": status
-    }, proc_img) # Send processed frame (with rectangles) to laptop
-
-    return av.VideoFrame.from_ndarray(proc_img, format="bgr24")
-
-def audio_frame_callback(frame: av.AudioFrame):
-    try:
-        sound = frame.to_ndarray()
-        rms = np.sqrt(np.mean(sound**2))
-        is_crying = rms > 2000
+        from moviepy.editor import VideoFileClip
+        clip = VideoFileClip(video_path)
         
-        # Update just the cry status, keep others same (not ideal in async but functional)
-        data = db.get()
-        vitals = data["live_vitals"]
-        vitals["cry"] = is_crying
-        db.update(vitals, data["latest_frame"])
+        if clip.audio is None:
+            return None, 0
+            
+        # Get audio as numpy array
+        # Read first 30 seconds max to save memory
+        duration = min(clip.duration, 30) 
+        audio = clip.audio.subclip(0, duration)
+        sps = audio.fps # Samples per second
+        data = audio.to_soundarray(fps=sps)
         
-    except: pass
-    return frame
+        # Convert stereo to mono
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+            
+        # Calculate Amplitude Envelope (simplify graph)
+        window = int(sps * 0.1) # 100ms window
+        envelope = [np.max(np.abs(data[i:i+window])) for i in range(0, len(data), window)]
+        
+        return np.array(envelope), sps/window # Return signal & new effective sampling rate
+        
+    except Exception as e:
+        # Fallback if moviepy fails or no audio
+        return None, 0
+
+def analyze_signal(signal_data, fps):
+    """
+    Applies filters and peak detection to count breaths accurately.
+    """
+    # 1. Smooth the noisy optical flow signal (Savgol filter)
+    # Window length must be odd and approx 1 second long
+    window = int(fps) 
+    if window % 2 == 0: window += 1
+    if len(signal_data) < window: return 0, signal_data, []
+    
+    smooth_signal = savgol_filter(signal_data, window, 3)
+    
+    # 2. Normalize signal (0 to 1) for better plotting
+    smooth_signal = (smooth_signal - np.min(smooth_signal)) / (np.max(smooth_signal) - np.min(smooth_signal) + 1e-6)
+    
+    # 3. Find Peaks (Breaths)
+    # Min distance: 0.5 sec (nobody breathes faster than 120 bpm)
+    # Prominence: ignores small jitters
+    peaks, _ = find_peaks(smooth_signal, distance=fps*0.5, prominence=0.1)
+    
+    # 4. Calculate Rate (Breaths Per Minute)
+    # We use the duration of the signal to get an accurate average
+    duration_sec = len(signal_data) / fps
+    bpm = (len(peaks) / duration_sec) * 60
+    
+    return bpm, smooth_signal, peaks
 
 # ==========================================
-# 5. UI PAGES
+# 3. MAIN APP INTERFACE
 # ==========================================
-def login_page():
-    st.markdown("## 🔐 Secure Access")
-    with st.form("login"):
-        u = st.text_input("User", "admin")
-        p = st.text_input("Password", type="password", value="admin")
-        if st.form_submit_button("Login"):
-            if u=="admin" and p=="admin":
-                st.session_state["auth"] = True
-                st.session_state["role"] = "Select"
-                st.rerun()
-            else:
-                st.error("Access Denied")
-
-def mobile_page():
-    st.title("📱 Mobile Sensor Unit (4K Ready)")
-    st.info("Ensure permissions are granted. Point camera at neonate.")
+def main():
+    st.title("🫁 Neonatal Respiratory Analyzer")
+    st.write("Upload a video of the baby. The system uses **Optical Flow Computer Vision** to track chest expansion and specific Audio Analysis for distress.")
     
-    webrtc_streamer(
-        key="mobile_sender",
-        mode=WebRtcMode.SENDONLY,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints=MEDIA_CONSTRAINTS,
-        video_frame_callback=video_frame_callback,
-        audio_frame_callback=audio_frame_callback,
-        async_processing=True
-    )
+    uploaded_file = st.file_uploader("Upload Video (MP4/MOV)", type=["mp4", "mov", "avi"])
     
-    st.write("Streaming active... check Laptop Dashboard.")
-
-def laptop_page():
-    st.title("💻 ICU Dashboard")
-    
-    tab1, tab2 = st.tabs(["📡 Live Mobile Feed", "📂 Upload Analysis"])
-    
-    # --- TAB 1: LIVE FEED FROM MOBILE ---
-    with tab1:
-        col_vid, col_stats = st.columns([2, 1])
+    if uploaded_file is not None:
+        # Save file locally for processing
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(uploaded_file.read())
+        video_path = tfile.name
         
-        # Auto-refresh loop for real-time feel
-        data = db.get()
-        frame = data["latest_frame"]
-        vitals = data["live_vitals"]
+        # --- LAYOUT ---
+        col_video, col_analysis = st.columns([1, 1.5])
         
-        with col_vid:
-            if frame is not None:
-                # Convert BGR to RGB
-                st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
-            else:
-                st.image(np.zeros((720, 1280, 3)), caption="Waiting for Mobile Stream...", use_container_width=True)
+        # 1. Show Original Video
+        with col_video:
+            st.subheader("Original Footage")
+            st.video(video_path)
+            
+        # 2. Run Analysis
+        raw_signal, fps, duration = extract_breathing_signal(video_path)
+        audio_env, audio_rate = process_audio(video_path)
         
-        with col_stats:
-            st.subheader("Live Vitals")
-            st.metric("Heart Rate", f"{vitals['bpm']} BPM")
-            st.metric("Breathing Rate", f"{vitals['rr']} /min")
+        if len(raw_signal) > 0:
+            bpm, smooth_signal, peaks = analyze_signal(raw_signal, fps)
             
-            # Status Logic
-            s_color = "status-ok"
-            if "High" in vitals['status'] or "Low" in vitals['status']: s_color = "status-crit"
-            elif vitals['cry']: s_color = "status-warn"
-            
-            st.markdown(f"""
-            <div class="status-card {s_color}">
-                <h3>Status: {vitals['status']}</h3>
-                <p>Crying: {'YES' if vitals['cry'] else 'NO'}</p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Charts
-            hist = data["history"]
-            fig = go.Figure()
-            if len(hist["bpm"]) > 0:
-                fig.add_trace(go.Scatter(y=list(hist["bpm"]), mode='lines', name='HR', line=dict(color='red')))
-            if len(hist["rr"]) > 0:
-                fig.add_trace(go.Scatter(y=list(hist["rr"]), mode='lines', name='RR', line=dict(color='cyan')))
-            fig.update_layout(height=200, margin=dict(l=0, r=0, t=0, b=0), showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            if st.button("Refresh Feed"):
-                st.rerun()
+            # --- RESULTS SECTION ---
+            with col_analysis:
+                st.subheader("Clinical Analysis Results")
+                
+                # DIAGNOSIS LOGIC
+                status = "Normal Breathing"
+                color = "stat-ok"
+                msg = f"Breathing rate is within the healthy neonatal range ({int(bpm)} BPM)."
+                
+                if bpm > 60:
+                    status = "Tachypnea (Respiratory Distress)"
+                    color = "stat-crit"
+                    msg = "⚠️ **High Alert:** Breathing is dangerously fast (>60 BPM). This is a primary sign of Pneumonia or RDS."
+                elif bpm < 30:
+                    status = "Bradypnea (Slow Breathing)"
+                    color = "stat-warn"
+                    msg = "⚠️ **Warning:** Breathing is slower than normal (<30 BPM). Monitor closely."
 
-    # --- TAB 2: UPLOAD ANALYSIS ---
-    with tab2:
-        st.write("Upload a video (e.g., YouTube recording) for instant analysis.")
-        f = st.file_uploader("Upload MP4", type=["mp4", "mov"])
-        if f:
-            tfile = tempfile.NamedTemporaryFile(delete=False)
-            tfile.write(f.read())
-            cap = cv2.VideoCapture(tfile.name)
-            
-            st_frame = st.empty()
-            st_metrics = st.empty()
-            
-            local_proc = VitalSignProcessor() # Separate processor for file
-            
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret: break
+                # Status Box
+                st.markdown(f"""
+                <div class="stat-box {color}">
+                    <h2 style="margin:0">{status}</h2>
+                    <h1 style="font-size: 48px; margin:0">{int(bpm)}</h1>
+                    <p>Breaths Per Minute</p>
+                </div>
+                <p style="margin-top:10px; padding:10px; background-color:#262730; border-radius:5px;">{msg}</p>
+                """, unsafe_allow_html=True)
                 
-                # Resize for processing speed
-                frame = cv2.resize(frame, (1280, 720))
-                p_frame, hr, rr = local_proc.process(frame)
+                # --- GRAPHS ---
+                st.subheader("Physiological Signals")
                 
-                # Predict
-                stat = "Optimal"
-                if rr > 60: stat = "Respiratory Distress (Tachypnea)"
+                # Create Time Axis
+                time_axis = np.linspace(0, duration, len(smooth_signal))
                 
-                st_frame.image(cv2.cvtColor(p_frame, cv2.COLOR_BGR2RGB), use_container_width=True)
-                st_metrics.markdown(f"""
-                ### File Analysis
-                **HR:** {hr} BPM | **RR:** {rr} /min
-                **Prediction:** {stat}
-                """)
+                fig = go.Figure()
                 
-                # Simulate real-time playback
-                # time.sleep(0.03)
-            cap.release()
+                # Trace 1: Breathing Motion (Smoothed)
+                fig.add_trace(go.Scatter(
+                    x=time_axis, y=smooth_signal,
+                    mode='lines', name='Chest Motion (Breathing)',
+                    line=dict(color='#00CC96', width=3)
+                ))
+                
+                # Trace 2: Detected Breaths (Peaks)
+                peak_times = time_axis[peaks]
+                peak_vals = smooth_signal[peaks]
+                fig.add_trace(go.Scatter(
+                    x=peak_times, y=peak_vals,
+                    mode='markers', name='Detected Breath',
+                    marker=dict(color='white', size=8, symbol='circle-open', line=dict(width=2))
+                ))
 
-# ==========================================
-# 6. MAIN ROUTING
-# ==========================================
-if "auth" not in st.session_state:
-    st.session_state["auth"] = False
+                # Trace 3: Audio (if exists)
+                if audio_env is not None and len(audio_env) > 0:
+                    # Align audio time axis
+                    audio_time = np.linspace(0, duration, len(audio_env))
+                    # Normalize audio for visualization overlay
+                    norm_audio = audio_env / (np.max(audio_env) + 1e-6) * 0.5 
+                    
+                    fig.add_trace(go.Scatter(
+                        x=audio_time, y=norm_audio,
+                        mode='lines', name='Audio Intensity (Cry/Gasp)',
+                        line=dict(color='#EF553B', width=1),
+                        opacity=0.6
+                    ))
 
-if not st.session_state["auth"]:
-    login_page()
-else:
-    # Role Selection (Persists after login)
-    if st.session_state.get("role") == "Select":
-        st.title("Select Device Mode")
-        c1, c2 = st.columns(2)
-        if c1.button("📱 Mobile Sensor (Baby Unit)"):
-            st.session_state["role"] = "Mobile"
-            st.rerun()
-        if c2.button("💻 Laptop Dashboard (Monitor)"):
-            st.session_state["role"] = "Laptop"
-            st.rerun()
-    
-    elif st.session_state["role"] == "Mobile":
-        if st.sidebar.button("Logout / Switch"):
-            st.session_state["auth"] = False
-            st.rerun()
-        mobile_page()
-        
-    elif st.session_state["role"] == "Laptop":
-        if st.sidebar.button("Logout / Switch"):
-            st.session_state["auth"] = False
-            st.rerun()
-        laptop_page()
-        # Auto-rerun for laptop to keep fetching frames
-        time.sleep(0.5)
-        st.rerun()
+                fig.update_layout(
+                    title="Breathing Pattern & Audio Correlation",
+                    xaxis_title="Time (seconds)",
+                    yaxis_title="Normalized Intensity",
+                    height=350,
+                    margin=dict(l=0, r=0, t=30, b=0),
+                    legend=dict(orientation="h", y=1.1)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # --- AUDIO DISTRESS CHECK ---
+                if audio_env is not None:
+                    avg_vol = np.mean(audio_env)
+                    peak_vol = np.max(audio_env)
+                    # Simple heuristic: if peak is 5x average, likely a cry or cough
+                    if peak_vol > avg_vol * 5:
+                        st.warning("🔊 **Audio Alert:** Sudden loud sounds detected (Crying, Coughing, or Gasping).")
+                    else:
+                        st.success("🔊 **Audio Status:** Audio levels are stable (Quiet breathing).")
+
+        else:
+            st.error("Could not process video. Please ensure the file is a valid video format.")
+            
+        # Cleanup
+        os.unlink(tfile.name)
+
+if __name__ == "__main__":
+    main()
